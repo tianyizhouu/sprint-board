@@ -1,0 +1,30 @@
+# Render Blueprint - on Render, choose New > Blueprint and point it at this repo
+#
+# NOTE - two hard limits on the free tier:
+#  1. Free web services sleep after 15 min idle; cold start is 30-60s.
+#     Open the URL once to warm it up before a demo.
+#  2. Free Postgres expires 30 days after creation. There is then a 14-day
+#     grace period to upgrade, after which the database and its data are deleted.
+#     The free tier has no backups. This demo will not survive a month - do not
+#     let it become something the team actually relies on.
+services:
+  - type: web
+    name: sprint-board
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sprint-board-db
+          property: connectionString
+      - key: PGSSL
+        value: require
+      # PORT is injected by Render - do not set it manually
+
+databases:
+  - name: sprint-board-db
+    plan: free
+    databaseName: sprintboard
+    user: sprint

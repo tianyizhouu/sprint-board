@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sprint Board -- Checkout Reliability</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<!-- -- Name gate: demo only, NOT authentication ----------------------- -->
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <span class="eyebrow">Demo access</span>
+    <h2>Enter your name</h2>
+    <p class="gate-note">This is a demo environment with no real sign-in. Your name is only used to label changes, and anyone can edit the data. <b>Do not enter any real client or project information.</b></p>
+    <input id="gateName" placeholder="e.g. Kevin" autocomplete="off" maxlength="40">
+    <div class="gate-quick" id="gateQuick"></div>
+    <button class="btn btn-primary btn-block" id="gateGo">Enter</button>
+  </div>
+</div>
+
+<div class="demo-banner">
+  <b>DEMO</b> &middot; Mock data &middot; No SSO - anyone with the link can edit &middot; Do not enter real client information
+</div>
+
+<div class="app" id="app" hidden>
+  <aside class="sidebar">
+    <div class="brand">Sprint Board<br><em>Checkout Reliability</em></div>
+
+    <div class="nav-group">
+      <span class="eyebrow">Views</span>
+      <button class="nav-item" data-view="board"      aria-current="true">Board <span class="n" id="nBoard"></span></button>
+      <button class="nav-item" data-view="timeline">Timeline</button>
+      <button class="nav-item" data-view="calendar">Calendar</button>
+    </div>
+    <div class="nav-group">
+      <span class="eyebrow">Planning</span>
+      <button class="nav-item" data-view="meetings">Meetings <span class="n" id="nMeet"></span></button>
+      <button class="nav-item" data-view="milestones">Milestones <span class="n" id="nMs"></span></button>
+    </div>
+
+    <div class="presence">
+      <span class="eyebrow">Online now</span>
+      <div id="presenceList" class="presence-list"></div>
+    </div>
+
+    <div class="sidebar-foot">
+      <span id="whoami"></span><br>
+      <button class="link-btn" id="switchUser">Switch name</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <span class="eyebrow">Sprint 24 &middot; Checkout Reliability</span>
+        <h1 id="viewTitle">Board</h1>
+        <div class="sub">Jul 20 - Aug 2, 2026 &middot; <b id="daysLeft"></b> &middot; <span id="conn" class="conn">Connecting&hellip;</span></div>
+      </div>
+      <div class="actions" id="viewActions"></div>
+    </div>
+
+    <!-- -- Board ------------------------------------------- -->
+    <div class="view" id="view-board">
+      <section class="ribbon" id="ribbon" aria-label="Sprint stage summary"></section>
+
+      <section class="panel">
+        <div class="panel-band">
+          <div><span class="eyebrow">Workstream detail</span><h2>Task board</h2></div>
+          <div class="band-right"><button class="band-btn" id="expandAll">Fit to content</button></div>
+        </div>
+        <div class="toolbar">
+          <input type="search" id="q" placeholder="Search task or SIM ID" aria-label="Search tasks">
+          <select id="fOwner"  aria-label="Filter by owner"><option value="">All owners</option></select>
+          <select id="fStatus" aria-label="Filter by status"><option value="">All statuses</option></select>
+          <select id="fStream" aria-label="Filter by workstream"><option value="">All workstreams</option></select>
+          <button class="btn btn-sm" id="clearF">Clear</button>
+          <span class="spacer"></span>
+          <span class="count" id="rowCount"></span>
+        </div>
+        <div class="table-wrap" id="tableWrap">
+          <table class="board" id="board">
+            <colgroup>
+              <col style="width:280px"><col style="width:112px"><col style="width:126px"><col style="width:126px">
+              <col style="width:124px"><col style="width:62px"><col style="width:100px"><col style="width:100px">
+              <col style="width:150px"><col><col style="width:40px">
+            </colgroup>
+            <thead><tr>
+              <th>Task</th><th>Workstream</th><th>Owner</th><th>Reviewer</th><th>Status</th>
+              <th>Pri</th><th>Start</th><th>ETA</th><th>Progress</th><th>Notes</th><th><span class="sr">Open</span></th>
+            </tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- -- Timeline ---------------------------------------- -->
+    <div class="view" id="view-timeline" hidden>
+      <section class="panel">
+        <div class="panel-band">
+          <div><span class="eyebrow">Sequencing</span><h2>Timeline</h2></div>
+          <div class="band-right">
+            <button class="band-btn" id="gPrev">&lsaquo;</button>
+            <button class="band-btn" id="gToday">Today</button>
+            <button class="band-btn" id="gNext">&rsaquo;</button>
+          </div>
+        </div>
+        <div class="gantt"><div class="gantt-grid" id="ganttGrid"></div></div>
+        <div class="legend">
+          <span><i style="background:#2c5580"></i> In flight</span>
+          <span><i style="background:#177b57"></i> Done</span>
+          <span><i style="border:1px dashed #c8891e;background:#fff"></i> Blocked</span>
+          <span><i class="dia"></i> Milestone</span>
+          <span><i style="background:#c8891e;width:2px"></i> Today</span>
+        </div>
+      </section>
+    </div>
+
+    <!-- -- Calendar ---------------------------------------- -->
+    <div class="view" id="view-calendar" hidden>
+      <section class="panel">
+        <div class="panel-band">
+          <div><span class="eyebrow">Schedule</span><h2 id="calTitle">Calendar</h2></div>
+          <div class="band-right">
+            <button class="band-btn" id="cPrev">&lsaquo;</button>
+            <button class="band-btn" id="cToday">Today</button>
+            <button class="band-btn" id="cNext">&rsaquo;</button>
+          </div>
+        </div>
+        <div class="cal" id="cal"></div>
+        <div class="legend">
+          <span><i style="background:#2c5580"></i> Meeting</span>
+          <span><i class="dia"></i> Milestone</span>
+          <span><i style="background:#eaeff5;border:1px solid #c3ccd8"></i> Task ETA</span>
+        </div>
+      </section>
+    </div>
+
+    <!-- -- Meetings ---------------------------------------- -->
+    <div class="view" id="view-meetings" hidden>
+      <section class="panel">
+        <div class="panel-band">
+          <div><span class="eyebrow">Planning</span><h2>Meetings</h2></div>
+        </div>
+        <div class="table-wrap">
+          <table class="board" id="meetTable">
+            <colgroup>
+              <col style="width:300px"><col style="width:118px"><col style="width:96px"><col style="width:96px">
+              <col style="width:112px"><col style="width:230px"><col><col style="width:40px">
+            </colgroup>
+            <thead><tr>
+              <th>Meeting</th><th>Date</th><th>Start</th><th>End</th><th>Type</th>
+              <th>Attendees</th><th>Agenda</th><th><span class="sr">Delete</span></th>
+            </tr></thead>
+            <tbody id="meetRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- -- Milestones -------------------------------------- -->
+    <div class="view" id="view-milestones" hidden>
+      <section class="panel">
+        <div class="panel-band">
+          <div><span class="eyebrow">Planning</span><h2>Milestones</h2></div>
+        </div>
+        <div class="table-wrap">
+          <table class="board" id="msTable">
+            <colgroup>
+              <col style="width:320px"><col style="width:126px"><col style="width:130px"><col style="width:130px"><col><col style="width:40px">
+            </colgroup>
+            <thead><tr>
+              <th>Milestone</th><th>Due</th><th>Status</th><th>Owner</th><th>Notes</th><th><span class="sr">Delete</span></th>
+            </tr></thead>
+            <tbody id="msRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- -- Task drawer --------------------------------------- -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dTitleH">
+  <div class="drawer-head">
+    <span class="eyebrow" id="dSim">--</span>
+    <h3 id="dTitleH">Task detail</h3>
+  </div>
+  <div class="drawer-body">
+    <div class="field"><label class="eyebrow" for="dTitle">Task</label><input id="dTitle"></div>
+    <div class="field-row">
+      <div class="field"><label class="eyebrow" for="dStream">Workstream</label><select id="dStream"></select></div>
+      <div class="field"><label class="eyebrow" for="dPri">Priority</label><select id="dPri"></select></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label class="eyebrow" for="dOwner">Owner</label><select id="dOwner"></select></div>
+      <div class="field"><label class="eyebrow" for="dReviewer">Reviewer</label><select id="dReviewer"></select></div>
+    </div>
+    <div class="field"><label class="eyebrow" for="dStatus">Status</label><select id="dStatus"></select></div>
+    <div class="field-row">
+      <div class="field"><label class="eyebrow" for="dStart">Start</label><input type="date" id="dStart"></div>
+      <div class="field"><label class="eyebrow" for="dEta">ETA</label><input type="date" id="dEta"></div>
+    </div>
+    <div class="field">
+      <label class="eyebrow" for="dProg">Progress <span class="mono" id="dProgVal"></span></label>
+      <input type="range" class="prog-range wide" id="dProg" min="0" max="100" step="5">
+    </div>
+    <div class="field"><label class="eyebrow" for="dNotes">Notes</label><textarea id="dNotes" rows="3"></textarea></div>
+    <div class="history"><span class="eyebrow">Activity</span><div id="dHistory"></div></div>
+  </div>
+  <div class="drawer-foot">
+    <button class="btn btn-ghost" id="dClose">Close</button>
+    <button class="btn btn-primary" id="dSave">Save changes</button>
+  </div>
+</aside>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

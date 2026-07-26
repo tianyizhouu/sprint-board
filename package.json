@@ -1,0 +1,18 @@
+{
+  "name": "sprint-board",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sprint Board demo - mock data only, no SSO. Not for real client information.",
+  "main": "server/index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "db:reset": "node scripts/reset-db.js"
+  },
+  "dependencies": {
+    "express": "^4",
+    "pg": "^8",
+    "socket.io": "^4"
+  }
+}

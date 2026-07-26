@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sprint
+      POSTGRES_PASSWORD: sprint
+      POSTGRES_DB: sprintboard
+    ports:
+      - "5433:5432"          # host 5433 to avoid clashing with a local postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs schema + seed on first boot only (when the volume is empty)
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sprint -d sprintboard"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://sprint:sprint@db:5432/sprintboard
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Mount source for local dev: edit, refresh, no rebuild needed
+    volumes:
+      - ./public:/app/public:ro
+      - ./server:/app/server:ro
+
+volumes:
+  pgdata:
