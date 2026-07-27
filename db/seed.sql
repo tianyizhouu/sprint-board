@@ -2,18 +2,35 @@
 -- Demo seed data. Entirely fictional - no real client, project or personal data.
 -- ============================================================
 
-TRUNCATE activity, tasks, meetings, milestones RESTART IDENTITY;
+TRUNCATE activity, tasks, meetings, milestones, people, settings RESTART IDENTITY;
 
-INSERT INTO tasks (sim, title, stream, owner, reviewer, status, pri, start_date, eta, prog, notes) VALUES
- ('SIM-12345','Implement login API',         'Backend', 'Kevin',  'Alice','In Progress','P0','2026-07-20','2026-07-27', 70,'REST endpoints for login and refresh'),
- ('SIM-12346','User authentication',         'Backend', 'Kevin',  'Mike', 'In Review',  'P1','2026-07-21','2026-07-26', 90,'Security review in progress'),
- ('SIM-12347','Payment service',             'Backend', 'Alice',  'Kevin','In Progress','P0','2026-07-23','2026-07-29', 45,'Authorization retry logic'),
- ('SIM-12348','Checkout UI',                 'Frontend','Bob',    'Alice','In Progress','P1','2026-07-21','2026-07-28', 60,'Responsive checkout page'),
- ('SIM-12349','Order history',               'Frontend','Bob',    'Mike', 'Not Started','P2','2026-07-27','2026-07-31',  0,'Awaiting API contract'),
- ('SIM-12350','Admin dashboard',             'Frontend','Charlie','Bob',  'Blocked',    'P1','2026-07-27','2026-07-31', 20,'Blocked by permissions API'),
- ('SIM-12351','Integration testing',         'QA',      'Maya',   'Kevin','In Progress','P1','2026-07-22','2026-07-30', 40,'Cross-service regression'),
- ('SIM-12352','UAT sign-off',                'QA',      'Daniel', 'Maya', 'Not Started','P1','2026-07-29','2026-08-02',  0,'Business sign-off'),
- ('SIM-12353','Bug fix: login redirect loop','Backend', 'Kevin',  'Alice','Done',       'P0','2026-07-20','2026-07-23',100,'Released to staging');
+-- Project-wide configuration (single row, id pinned to 1)
+INSERT INTO settings (id, project_name, capacity_unit, unit_abbrev, default_capacity, sprint_length_days, timezone) VALUES
+ (1, 'Sprint Board', 'Hours', 'h', 40, 14, 'America/Chicago');
+
+-- The seven demo team members. Everyone has the standard 40 h capacity; the
+-- workload spread comes from the effort on their tasks instead. Kevin is
+-- deliberately over capacity (46 h assigned vs 40 h) so the Overloaded state is
+-- visible, Bob sits just under at 38 h, and the rest are comfortably below.
+INSERT INTO people (name, capacity) VALUES
+ ('Kevin',  40),
+ ('Alice',  40),
+ ('Bob',    40),
+ ('Maya',   40),
+ ('Daniel', 40),
+ ('Mike',   40),
+ ('Charlie',40);
+
+INSERT INTO tasks (sim, title, stream, owner, reviewer, status, pri, start_date, eta, prog, notes, effort) VALUES
+ ('SIM-12345','Implement login API',         'Backend', 'Kevin',  'Alice','In Progress','P0','2026-07-20','2026-07-27', 70,'REST endpoints for login and refresh',      26),
+ ('SIM-12346','User authentication',         'Backend', 'Kevin',  'Mike', 'In Review',  'P1','2026-07-21','2026-07-26', 90,'Security review in progress',               20),
+ ('SIM-12347','Payment service',             'Backend', 'Alice',  'Kevin','In Progress','P0','2026-07-23','2026-07-29', 45,'Authorization retry logic',                 16),
+ ('SIM-12348','Checkout UI',                 'Frontend','Bob',    'Alice','In Progress','P1','2026-07-21','2026-07-28', 60,'Responsive checkout page',                  22),
+ ('SIM-12349','Order history',               'Frontend','Bob',    'Mike', 'Not Started','P2','2026-07-27','2026-07-31',  0,'Awaiting API contract',                     16),
+ ('SIM-12350','Admin dashboard',             'Frontend','Charlie','Bob',  'Blocked',    'P1','2026-07-27','2026-07-31', 20,'Blocked by permissions API',                12),
+ ('SIM-12351','Integration testing',         'QA',      'Maya',   'Kevin','In Progress','P1','2026-07-22','2026-07-30', 40,'Cross-service regression',                  20),
+ ('SIM-12352','UAT sign-off',                'QA',      'Daniel', 'Maya', 'Not Started','P1','2026-07-29','2026-08-02',  0,'Business sign-off',                         10),
+ ('SIM-12353','Bug fix: login redirect loop','Backend', 'Kevin',  'Alice','Done',       'P0','2026-07-20','2026-07-23',100,'Released to staging',                         8);
 
 INSERT INTO meetings (title, meeting_date, start_time, end_time, kind, attendees, agenda) VALUES
  ('Daily stand-up',            '2026-07-27','09:15','09:30','Stand-up', ARRAY['Kevin','Alice','Bob','Maya'],        'Blockers and today''s plan'),

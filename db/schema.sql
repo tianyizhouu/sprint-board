@@ -8,6 +8,8 @@ DROP TABLE IF EXISTS activity;
 DROP TABLE IF EXISTS tasks;
 DROP TABLE IF EXISTS meetings;
 DROP TABLE IF EXISTS milestones;
+DROP TABLE IF EXISTS people;
+DROP TABLE IF EXISTS settings;
 
 -- -- Tasks ---------------------------------------------------
 -- Column names deliberately match the frontend task object, so no mapping layer
@@ -24,6 +26,7 @@ CREATE TABLE tasks (
   eta         DATE,
   prog        INTEGER NOT NULL DEFAULT 0 CHECK (prog BETWEEN 0 AND 100),
   notes       TEXT DEFAULT '',
+  effort      NUMERIC(6,1) NOT NULL DEFAULT 0,   -- bare number; the display unit lives in settings
 
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -61,6 +64,37 @@ CREATE TABLE milestones (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_by TEXT
+);
+
+-- -- Settings -----------------------------------------------
+-- Single-row table (id is pinned to 1) holding project-wide configuration.
+-- capacity_unit / unit_abbrev drive how every effort figure is labelled.
+CREATE TABLE settings (
+  id                 INTEGER PRIMARY KEY DEFAULT 1,
+  project_name       TEXT NOT NULL DEFAULT 'Sprint Board',
+  capacity_unit      TEXT NOT NULL DEFAULT 'Hours',      -- Hours | Days | Story Points | custom
+  unit_abbrev        TEXT NOT NULL DEFAULT 'h',          -- shown next to numbers, e.g. "6 h"
+  default_capacity   NUMERIC(6,1) NOT NULL DEFAULT 40,
+  sprint_length_days INTEGER NOT NULL DEFAULT 14,
+  timezone           TEXT NOT NULL DEFAULT 'America/Chicago',
+
+  version            INTEGER NOT NULL DEFAULT 1,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by         TEXT,
+  CONSTRAINT settings_single_row CHECK (id = 1)
+);
+
+-- -- People -------------------------------------------------
+-- A name typed at the gate is upserted here, so it shows up in everyone's
+-- owner/reviewer dropdowns. capacity NULL means fall back to default_capacity.
+CREATE TABLE people (
+  name       TEXT PRIMARY KEY,
+  capacity   NUMERIC(6,1),
+  active     BOOLEAN NOT NULL DEFAULT true,
+
+  version    INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- -- Activity log --------------------------------------------

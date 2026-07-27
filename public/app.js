@@ -11,9 +11,13 @@ const SPRINT = { start:'2026-07-20', end:'2026-08-02' };
 const state = {
   actor: '',
   tasks: [], meetings: [], milestones: [],
-  meta: { people:[], streams:[], statuses:[], pris:[], msStatuses:[], kinds:[] },
+  meta: { people:[], streams:[], statuses:[], pris:[], msStatuses:[], kinds:[], settings:null },
   view: 'board',
+  scope: 'all',                 // board scope: all | mine | backlog | done
   openId: null,
+  evEdit: null,                 // { kind, id } while editing an event in the modal
+  wlPerson: null,               // selected person on the Team Workload view
+  collapsed: new Set(),         // collapsed timeline sections
   ganttAnchor: new Date('2026-07-20T00:00:00'),
   calMonth: new Date('2026-07-01T00:00:00'),
   socket: null,
@@ -32,8 +36,16 @@ const initials = n => String(n||'?').trim().split(/\s+/).map(w=>w[0]).join('').s
 const iso = d => { const x=new Date(d); x.setMinutes(x.getMinutes()-x.getTimezoneOffset()); return x.toISOString().slice(0,10); };
 const addDays = (d,n) => { const x=new Date(d); x.setDate(x.getDate()+n); return x; };
 const isWeekend = ds => { const g=new Date(ds+'T00:00:00').getDay(); return g===0||g===6; };
-const shortDate = ds => ds ? new Date(ds+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '--';
+const shortDate = ds => ds ? new Date(String(ds).slice(0,10)+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '--';
 const slug = s => String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+
+/* Display unit for effort/capacity. Never hardcode: it comes from settings. */
+const unitAbbrev = () => (state.meta.settings && state.meta.settings.unit_abbrev) || 'h';
+const fmtEffort  = v => `${Number(v || 0)} ${unitAbbrev()}`;
+/* people arrive as { name, capacity }; everywhere we only need the names */
+const peopleNames = () => (state.meta.people || []).map(p => (p && typeof p === 'object') ? p.name : p);
+const sprintPct = () => state.tasks.length
+  ? Math.round(state.tasks.reduce((a,b)=>a+Number(b.prog||0),0)/state.tasks.length) : 0;
 
 function toast(msg, warn){
   const t = $('#toast');
@@ -44,8 +56,10 @@ function toast(msg, warn){
 }
 
 function options(list, sel){
-  return (list||[]).map(v =>
-    `<option value="${esc(v)}"${String(v)===String(sel)?' selected':''}>${esc(v)}</option>`).join('');
+  return (list||[]).map(v => {
+    const val = (v && typeof v === 'object') ? v.name : v;   // tolerate people objects
+    return `<option value="${esc(val)}"${String(val)===String(sel)?' selected':''}>${esc(val)}</option>`;
+  }).join('');
 }
 
 /* -- API --------------------------------------------------- */
@@ -83,7 +97,7 @@ async function patchRow(entity, id, patch){
     if (e.status === 409){
       if (e.current) replaceRow(coll, e.current);
       renderCurrent();
-      toast(`Modified by <b>${esc(e.lastEditor || 'someone else')}</b>. Refreshed to the latest values \u2014 please re-check your change.`, true);
+      toast(`Modified by <b>${esc(e.lastEditor || 'someone else')}</b>. Refreshed to the latest values — please re-check your change.`, true);
     } else {
       renderCurrent();
       toast(`Save failed: ${esc(e.message)}`, true);
@@ -118,17 +132,21 @@ function initGate(){
     sessionStorage.setItem('sb_actor', name);
     $('#gate').hidden = true;
     $('#app').hidden = false;
-    $('#whoami').innerHTML = `Acting as <b style="color:#fff">${esc(name)}</b>`;
+    $('#userName').textContent = name;
+    $('#userAvatar').textContent = initials(name);
     boot();
   }
 }
-$('#switchUser').addEventListener('click', () => {
+$('#userChip').addEventListener('click', () => {
   sessionStorage.removeItem('sb_actor');
   location.reload();
 });
 
 /* -- Bootstrap ----------------------------------------------------------- */
 async function boot(){
+  /* Register the gate name so it reaches every client's dropdowns, then load. */
+  try { await req('POST','/api/people', { name: state.actor }); } catch(e){ /* non-fatal */ }
+
   try {
     const [meta, tasks, meetings, milestones] = await Promise.all([
       req('GET','/api/meta'), req('GET','/api/tasks'),
@@ -141,17 +159,40 @@ async function boot(){
     return;
   }
 
-  const m = state.meta;
-  $('#fOwner').innerHTML  = '<option value="">All owners</option>'     + options(m.people);
-  $('#fStatus').innerHTML = '<option value="">All statuses</option>'   + options(m.statuses);
-  $('#fStream').innerHTML = '<option value="">All workstreams</option>'+ options(m.streams);
+  applySettings();
+  populateFilters();
 
+  $('#sprintRange').textContent = `${shortDate(SPRINT.start)} – ${shortDate(SPRINT.end)}`;
   const end = new Date(SPRINT.end + 'T00:00:00');
   const dl = Math.round((end - new Date(TODAY + 'T00:00:00')) / 864e5);
   $('#daysLeft').textContent = dl >= 0 ? `${dl} days left` : `ended ${-dl}d ago`;
 
   connectSocket();
-  renderAll();
+  setView('board');
+}
+
+/* project name (settings) drives the sidebar brand and the tab title */
+function applySettings(){
+  const name = (state.meta.settings && state.meta.settings.project_name) || 'Sprint Board';
+  /* Brand logotype: the last word takes the blue accent, joined tight (e.g.
+     "Sprint" + "Board" -> "SprintBoard"). */
+  const parts = name.trim().split(/\s+/);
+  if (parts.length > 1){
+    const last = parts.pop();
+    $('#brand').innerHTML = esc(parts.join(' ')) + '<span class="brand-accent">' + esc(last) + '</span>';
+  } else {
+    $('#brand').textContent = name;
+  }
+  document.title = name;
+}
+
+function populateFilters(){
+  const m = state.meta, names = peopleNames();
+  const keep = { o:$('#fOwner').value, r:$('#fReviewer').value, s:$('#fStatus').value, w:$('#fStream').value };
+  $('#fOwner').innerHTML    = '<option value="">All owners</option>'     + options(names, keep.o);
+  $('#fReviewer').innerHTML = '<option value="">All reviewers</option>'  + options(names, keep.r);
+  $('#fStatus').innerHTML   = '<option value="">All statuses</option>'   + options(m.statuses, keep.s);
+  $('#fStream').innerHTML   = '<option value="">All workstreams</option>'+ options(m.streams, keep.w);
 }
 
 /* -- Socket ------------------------------------------------ */
@@ -161,7 +202,7 @@ function connectSocket(){
 
   const setConn = (txt, cls) => { const c = $('#conn'); c.textContent = txt; c.className = 'conn ' + cls; };
   socket.on('connect',    () => setConn('LIVE', 'on'));
-  socket.on('disconnect', () => setConn('OFFLINE - reconnecting', 'off'));
+  socket.on('disconnect', () => setConn('OFFLINE', 'off'));
   socket.on('connect_error', () => setConn('CONNECT FAILED', 'off'));
 
   for (const [entity, coll] of Object.entries(COLL)){
@@ -182,6 +223,23 @@ function connectSocket(){
     });
   }
 
+  /* A name entered at another gate, or a capacity change, updates the roster. */
+  socket.on('people:updated', ({ row }) => {
+    if (!row || !row.name) return;
+    upsertMetaPerson(row);
+    populateFilters();
+    renderCurrent();
+  });
+
+  /* A settings change (e.g. the capacity unit) must reflect on open tabs. */
+  socket.on('settings:updated', ({ row }) => {
+    if (!row) return;
+    state.meta.settings = row;
+    applySettings();
+    if (state.openId != null) $('#dEffortUnit').textContent = unitAbbrev();
+    renderCurrent();
+  });
+
   socket.on('presence', names => {
     const el = $('#presenceList');
     el.innerHTML = names.length
@@ -197,17 +255,19 @@ function flash(entity, id){
 }
 
 /* -- View switching ------------------------------------------------------ */
-const VIEW_TITLE = { board:'Board', timeline:'Timeline', calendar:'Calendar', meetings:'Meetings', milestones:'Milestones' };
+const HAS_VIEW = { board:1, timeline:1, calendar:1, meetings:1, milestones:1 };
+
+function setActiveNav(btn){
+  $$('.nav-item').forEach(b => b.setAttribute('aria-current', String(b === btn)));
+}
 
 function setView(v){
   state.view = v;
-  $$('.nav-item').forEach(b => b.setAttribute('aria-current', String(b.dataset.view === v)));
   $$('.view').forEach(el => { el.hidden = el.id !== `view-${v}`; });
-  $('#viewTitle').textContent = VIEW_TITLE[v] || v;
 
   const acts = $('#viewActions');
   acts.innerHTML =
-    v === 'board'      ? `<button class="btn" id="exportBtn">Export CSV</button><button class="btn btn-primary" id="addTask">New task</button>`
+    v === 'board'      ? `<button class="btn btn-primary" id="addTask">New task</button>`
   : v === 'meetings'   ? `<button class="btn btn-primary" id="addMeet">New meeting</button>`
   : v === 'milestones' ? `<button class="btn btn-primary" id="addMs">New milestone</button>`
   : '';
@@ -215,33 +275,49 @@ function setView(v){
 }
 
 function renderCurrent(){
-  if (state.view === 'board')      { renderRibbon(); renderBoard(); }
-  else if (state.view === 'timeline')  renderGantt();
-  else if (state.view === 'calendar')  renderCalendar();
-  else if (state.view === 'meetings')  renderMeetings();
-  else if (state.view === 'milestones')renderMilestones();
+  if (state.view === 'board')      { renderSummary(); renderBoard(); }
+  else if (state.view === 'timeline')    renderGantt();
+  else if (state.view === 'calendar')    renderCalendar();
+  else if (state.view === 'meetings')    renderMeetings();
+  else if (state.view === 'milestones')  renderMilestones();
+  else if (state.view === 'workstreams') renderWorkstreams();
+  else if (state.view === 'workload')    renderWorkload();
+  else if (state.view === 'reports')     renderReports();
   renderCounts();
 }
-function renderAll(){ renderCurrent(); }
 
 function renderCounts(){
-  $('#nBoard').textContent = state.tasks.filter(t => t.status !== 'Done').length;
+  $('#nBoard').textContent = state.tasks.length;
+  $('#nMine').textContent  = state.tasks.filter(t => inScope(t,'mine')).length;
+  $('#nBack').textContent  = state.tasks.filter(t => inScope(t,'backlog')).length;
+  $('#nComp').textContent  = state.tasks.filter(t => inScope(t,'done')).length;
   $('#nMeet').textContent  = state.meetings.length;
   $('#nMs').textContent    = state.milestones.length;
+  $('#topPct').textContent = sprintPct() + '%';
 }
 
 /* -- Board ------------------------------------------------- */
 const STATUS_CLASS = {
   'Not Started':'s-not','In Progress':'s-prog','In Review':'s-review','Blocked':'s-block','Done':'s-done'
 };
-const FIELDS = ['title','stream','owner','reviewer','status','pri','start_date','eta','prog','notes'];
+const FIELDS = ['title','stream','owner','reviewer','status','pri','effort','start_date','eta','prog','notes'];
+
+/* Base scope (from the Workspace nav) applied before the toolbar filters. */
+function inScope(t, scope){
+  if (scope === 'mine')    return (t.owner === state.actor || t.reviewer === state.actor) && t.status !== 'Done';
+  if (scope === 'backlog') return t.status === 'Not Started';
+  if (scope === 'done')    return t.status === 'Done';
+  return true;
+}
 
 function visibleTasks(){
   const q  = ($('#q').value || '').trim().toLowerCase();
-  const fo = $('#fOwner').value, fs = $('#fStatus').value, fw = $('#fStream').value;
+  const fo = $('#fOwner').value, fr = $('#fReviewer').value, fs = $('#fStatus').value, fw = $('#fStream').value;
   return state.tasks.filter(t =>
+    inScope(t, state.scope) &&
     (!q || `${t.sim} ${t.title}`.toLowerCase().includes(q)) &&
-    (!fo || t.owner === fo) && (!fs || t.status === fs) && (!fw || t.stream === fw)
+    (!fo || t.owner === fo) && (!fr || t.reviewer === fr) &&
+    (!fs || t.status === fs) && (!fw || t.stream === fw)
   );
 }
 
@@ -264,6 +340,8 @@ function paintTaskCell(td){
       inner = `<span class="chip ${STATUS_CLASS[t.status]||'s-not'}">${esc(t.status)}</span>`; pick = true; break;
     case 'pri':
       inner = `<span class="pri pri-${esc(t.pri)}">${esc(t.pri)}</span>`; pick = true; break;
+    case 'effort':
+      inner = `<span class="cell-val effort-val">${esc(fmtEffort(t.effort))}</span>`; pick = true; break;
     case 'start_date': case 'eta': {
       const late = f === 'eta' && t.eta && t.eta < TODAY && t.status !== 'Done';
       inner = `<span class="date-val${late?' late':''}">${esc(shortDate(t[f]))}</span>`; pick = true; break;
@@ -299,8 +377,8 @@ function renderBoard(){
 
   tbody.innerHTML = '';
   if (!list.length){
-    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state">
-      <span class="eyebrow">No tasks</span>Nothing matches the current filters.</div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12"><div class="empty-state">
+      <span class="eyebrow">No tasks</span>Nothing matches the current view.</div></td></tr>`;
     $('#rowCount').textContent = '0 tasks';
     return;
   }
@@ -332,33 +410,18 @@ function renderBoard(){
   }
 }
 
-function renderRibbon(){
+function renderSummary(){
   const n = s => state.tasks.filter(t => t.status === s).length;
-  const stages = [
-    ['Not started', n('Not Started'), ''],
-    ['In progress', n('In Progress'), 'active'],
-    ['In review',   n('In Review'),   'active'],
-    ['Blocked',     n('Blocked'),     'risk'],
-    ['Done',        n('Done'),        'done'],
+  const cards = [
+    ['Not Started', n('Not Started')],
+    ['In Progress', n('In Progress')],
+    ['In Review',   n('In Review')],
+    ['Blocked',     n('Blocked')],
+    ['Done',        n('Done')],
+    ['Sprint Completion', sprintPct() + '%'],
   ];
-  const pct = state.tasks.length
-    ? Math.round(state.tasks.reduce((a,b)=>a+Number(b.prog),0)/state.tasks.length) : 0;
-  const late = state.tasks.filter(t => t.eta && t.eta < TODAY && t.status !== 'Done').length;
-
-  $('#ribbon').innerHTML =
-    stages.map(([name,v,st],i) => `
-      <div class="stage ${st}">
-        <span class="node">${st==='done'?'&check;':i+1}</span>
-        <span class="stage-tx">
-          <span class="stage-name">${esc(name)}</span>
-          <span class="stage-count"><b>${v}</b> ${v===1?'task':'tasks'}</span>
-        </span>
-      </div>`).join('') +
-    `<div class="ribbon-aside">
-       <span class="eyebrow">Sprint completion</span>
-       <span class="big">${pct}%</span>
-       <span class="note">${n('Blocked')} blocked - ${late} past ETA</span>
-     </div>`;
+  $('#summary').innerHTML = cards.map(([label, val]) =>
+    `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(val)}</div></div>`).join('');
 }
 
 /* -- Shared inline editing (board / meetings / milestones) --------------- */
@@ -371,7 +434,7 @@ function editCell(td, cfg){
 
   const m = state.meta;
   const SELECTS = {
-    stream:m.streams, owner:m.people, reviewer:m.people, status:null,
+    stream:m.streams, owner:peopleNames(), reviewer:peopleNames(), status:null,
     pri:m.pris, kind:m.kinds,
   };
   let el;
@@ -381,6 +444,9 @@ function editCell(td, cfg){
   } else if (SELECTS[f]){
     el = document.createElement('select');
     el.innerHTML = options(SELECTS[f], row[f]);
+  } else if (f === 'effort'){
+    el = document.createElement('input'); el.type = 'number'; el.min = '0'; el.step = '0.5';
+    el.value = Number(row.effort || 0);
   } else if (/(_date|^eta$)/.test(f)){
     el = document.createElement('input'); el.type = 'date'; el.value = row[f] || '';
   } else if (/_time$/.test(f)){
@@ -405,9 +471,11 @@ function editCell(td, cfg){
     if (f === 'attendees') val = val.split(',').map(s=>s.trim()).filter(Boolean);
     const same = f === 'attendees'
       ? JSON.stringify(val) === JSON.stringify(row.attendees || [])
+      : f === 'effort'
+      ? Number(val || 0) === Number(row.effort || 0)
       : String(row[f] ?? '') === String(val);
     if (same){ repaint(); return; }
-    patchRow(entity, id, { [f]: val });
+    patchRow(entity, id, { [f]: f === 'effort' ? Number(val || 0) : val });
   };
   el.addEventListener('blur', commit);
   el.addEventListener('change', () => { if (el.tagName === 'SELECT' || el.type === 'date' || el.type === 'time') commit(); });
@@ -417,8 +485,10 @@ function editCell(td, cfg){
   });
 }
 
-/* -- Gantt ------------------------------------------------- */
+/* -- Timeline (collapsible workstream sections) -------------------------- */
 const GDAYS = 14;
+const CHEV = `<svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
 function renderGantt(){
   const dates = Array.from({length:GDAYS},(_,i)=>iso(addDays(state.ganttAnchor,i)));
   const grid = $('#ganttGrid');
@@ -432,14 +502,20 @@ function renderGantt(){
   const bands = dates.map((d,i) => isWeekend(d)
     ? `<span class="wknd-band" style="left:${i/GDAYS*100}%;width:${100/GDAYS}%"></span>` : '').join('');
 
+  const section = (key, cls, label, count, open) =>
+    `<div class="g-stream${cls}" role="button" tabindex="0" data-stream="${esc(key)}" aria-expanded="${open}">
+       ${CHEV}${esc(label)}<span class="g-count">${count}</span></div>`;
+
   const list = visibleTasks();
   (state.meta.streams||[]).forEach(ws => {
     const rows = list.filter(t => t.stream === ws)
       .sort((a,b) => String(a.start_date).localeCompare(String(b.start_date)));
     if (!rows.length) return;
-    html += `<div class="g-stream">${esc(ws)} - ${rows.length}</div>`;
+    const open = !state.collapsed.has(ws);
+    html += section(ws, '', ws, rows.length, open);
+    if (!open) return;
     rows.forEach(t => {
-      html += `<div class="g-label"><div class="nm">${esc(t.title)}</div><div class="mt">${esc(t.owner)} - ${t.prog}%</div></div>`;
+      html += `<div class="g-label"><div class="nm">${esc(t.title)}</div><div class="mt">${esc(t.owner)} · ${t.prog}%</div></div>`;
       const s = dates.indexOf(t.start_date), e = dates.indexOf(t.eta);
       const from = s>=0 ? s : (t.start_date && t.start_date < dates[0] ? 0 : GDAYS);
       const to   = e>=0 ? e : (t.eta && t.eta > dates[GDAYS-1] ? GDAYS-1 : -1);
@@ -447,23 +523,33 @@ function renderGantt(){
       if (to >= 0 && from < GDAYS){
         const a = Math.max(0,from), b = Math.min(GDAYS-1,to);
         const left = a/GDAYS*100, width = Math.max(2.4,(b-a+1)/GDAYS*100-0.5);
-        const cls = t.status==='Blocked' ? ' blocked' : t.status==='Done' ? ' done' : '';
+        const cls = ' ' + (STATUS_CLASS[t.status] || 's-prog');   // colour the bar by status, matching the board badges
         bar = `<div class="g-bar${cls}" data-open="${t.id}" style="left:${left}%;width:${width}%"
-                title="${esc(t.title)} - ${esc(t.start_date)} → ${esc(t.eta)}">${t.prog}%</div>`;
+                title="${esc(t.title)} · ${esc(t.start_date)} → ${esc(t.eta)}">${t.prog}%</div>`;
       }
       html += `<div class="g-track">${bands}${bar}</div>`;
     });
   });
 
-  /* Milestones get their own group, rendered as diamonds */
-  const ms = state.milestones.filter(x => dates.includes(x.due_date));
-  if (ms.length){
-    html += `<div class="g-stream ms">Milestones - ${ms.length}</div>`;
-    ms.forEach(x => {
-      const i = dates.indexOf(x.due_date);
-      html += `<div class="g-label"><div class="nm">${esc(x.title)}</div><div class="mt">${esc(x.status)}</div></div>`;
-      html += `<div class="g-track">${bands}<div class="g-dia${x.status==='Done'?' done':''}"
-                 style="left:${(i+0.5)/GDAYS*100}%" title="${esc(x.title)} - ${esc(x.due_date)}"></div></div>`;
+  /* Milestones and meetings share a collapsible group of dated markers:
+     diamonds for milestones, amber squares for meetings. */
+  const events = [
+    ...state.milestones.filter(x => dates.includes(x.due_date))
+        .map(x => ({ kind:'ms', date:x.due_date, title:x.title, sub:x.status, done:x.status === 'Done' })),
+    ...state.meetings.filter(m => dates.includes(m.meeting_date))
+        .map(m => ({ kind:'meet', date:m.meeting_date, title:m.title, sub:(m.start_time || '').slice(0,5) || 'Meeting' })),
+  ].sort((a,b) => a.date.localeCompare(b.date));
+  if (events.length){
+    const open = !state.collapsed.has('__events');
+    html += section('__events', ' ms', 'Milestones & meetings', events.length, open);
+    if (open) events.forEach(e => {
+      const i = dates.indexOf(e.date), left = (i + 0.5) / GDAYS * 100;
+      const attrs = `data-ev-kind="${e.kind}" data-ev-id="${e.id}"`;
+      const marker = e.kind === 'ms'
+        ? `<div class="g-dia${e.done ? ' done' : ''}" ${attrs} style="left:${left}%" title="${esc(e.title)} · ${esc(e.date)}"></div>`
+        : `<div class="g-meet" ${attrs} style="left:${left}%" title="${esc(e.title)} · ${esc(e.date)} ${esc(e.sub)}"></div>`;
+      html += `<div class="g-label"><div class="nm">${esc(e.title)}</div><div class="mt">${esc(e.sub)}</div></div>`;
+      html += `<div class="g-track">${bands}${marker}</div>`;
     });
   }
 
@@ -471,11 +557,16 @@ function renderGantt(){
 
   const ti = dates.indexOf(TODAY);
   if (ti >= 0){
-    const pos = `calc(190px + (100% - 190px) * ${(ti+0.5)/GDAYS})`;
+    const pos = `calc(200px + (100% - 200px) * ${(ti+0.5)/GDAYS})`;
     const line = document.createElement('div'); line.className='g-today'; line.style.left=pos;
     const tag  = document.createElement('div'); tag.className='g-today-tag'; tag.style.left=pos; tag.textContent='TODAY';
     grid.append(line, tag);
   }
+}
+
+function toggleSection(key){
+  if (state.collapsed.has(key)) state.collapsed.delete(key); else state.collapsed.add(key);
+  renderGantt();
 }
 
 /* -- Calendar ---------------------------------------------- */
@@ -488,20 +579,19 @@ function renderCalendar(){
   const startOffset = first.getDay();              // week starts Sunday
   const gridStart = addDays(first, -startOffset);
 
-  /* Bucket the three event types by date */
   const byDay = {};
   const push = (d,ev) => { if(!d) return; (byDay[d] = byDay[d] || []).push(ev); };
   state.meetings.forEach(m => push(m.meeting_date, {
-    type:'meet', sort:m.start_time || '',
-    html:`<div class="cal-ev meet" title="${esc(m.title)} - ${esc(m.start_time)}-${esc(m.end_time)} - ${esc((m.attendees||[]).join(', '))}"><span class="tm">${esc((m.start_time||'').slice(0,5))}</span>${esc(m.title)}</div>`
+    sort:m.start_time || '',
+    html:`<div class="cal-ev meet" title="${esc(m.title)} · ${esc(m.start_time)}-${esc(m.end_time)} · ${esc((m.attendees||[]).join(', '))}"><span class="tm">${esc((m.start_time||'').slice(0,5))}</span>${esc(m.title)}</div>`
   }));
   state.milestones.forEach(x => push(x.due_date, {
-    type:'ms', sort:'!',
-    html:`<div class="cal-ev ms" title="${esc(x.title)} - ${esc(x.status)}">◆ ${esc(x.title)}</div>`
+    sort:'!',
+    html:`<div class="cal-ev ms" title="${esc(x.title)} · ${esc(x.status)}">◆ ${esc(x.title)}</div>`
   }));
   state.tasks.forEach(t => { if (t.status !== 'Done') push(t.eta, {
-    type:'eta', sort:'zz',
-    html:`<div class="cal-ev eta" data-open="${t.id}" title="ETA - ${esc(t.title)} - ${esc(t.owner)}">ETA ${esc(t.title)}</div>`
+    sort:'zz',
+    html:`<div class="cal-ev eta" data-open="${t.id}" title="ETA · ${esc(t.title)} · ${esc(t.owner)}">ETA ${esc(t.title)}</div>`
   }); });
 
   const dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -622,26 +712,41 @@ function renderMilestones(){
 }
 
 /* -- Drawer ------------------------------------------------ */
+const FIELD_LABEL = {
+  start_date:'Start', eta:'ETA', prog:'Progress', pri:'Priority', effort:'Effort',
+  stream:'Workstream', owner:'Owner', reviewer:'Reviewer', status:'Status', title:'Task', notes:'Notes',
+};
+const actLabel = f => FIELD_LABEL[f] || f;      // fall back to the raw column name
+function actVal(f, v){
+  if (v === null || v === undefined || v === '') return 'empty';
+  if (f === 'prog') return v + '%';
+  if (f === 'effort') return Number(v) + ' ' + unitAbbrev();
+  if (f === 'start_date' || f === 'eta') return shortDate(v);
+  return String(v);
+}
+
 async function openDrawer(id){
   const t = state.tasks.find(x => x.id === id);
   if (!t) return;
   state.openId = id;
-  const m = state.meta;
+  const m = state.meta, names = peopleNames();
   $('#dSim').textContent = t.sim;
   $('#dTitleH').textContent = t.title;
   $('#dTitle').value = t.title;
   $('#dStream').innerHTML   = options(m.streams, t.stream);
   $('#dPri').innerHTML      = options(m.pris, t.pri);
-  $('#dOwner').innerHTML    = options(m.people, t.owner);
-  $('#dReviewer').innerHTML = options(m.people, t.reviewer);
+  $('#dOwner').innerHTML    = options(names, t.owner);
+  $('#dReviewer').innerHTML = options(names, t.reviewer);
   $('#dStatus').innerHTML   = options(m.statuses, t.status);
+  $('#dEffort').value = Number(t.effort || 0);
+  $('#dEffortUnit').textContent = unitAbbrev();
   $('#dStart').value = t.start_date || '';
   $('#dEta').value   = t.eta || '';
   const pr = $('#dProg');
   pr.value = t.prog; pr.style.setProperty('--pct', t.prog + '%');
   $('#dProgVal').textContent = t.prog + '%';
   $('#dNotes').value = t.notes || '';
-  $('#dHistory').innerHTML = '<div class="hist-row"><div style="color:var(--slate-mid)">Loading&hellip;</div></div>';
+  $('#dHistory').innerHTML = '<div class="hist-row"><div style="color:var(--muted)">Loading&hellip;</div></div>';
 
   $('#drawer').classList.add('open');
   $('#scrim').classList.add('open');
@@ -653,11 +758,11 @@ async function openDrawer(id){
       const when = new Date(a.at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
       const what = a.action === 'create' ? 'created this task'
         : a.action === 'delete' ? 'deleted this task'
-        : `changed <b>${esc(a.field)}</b> from ${esc(a.old_value ?? 'empty')} to <b>${esc(a.new_value ?? 'empty')}</b>`;
+        : `changed <b>${esc(actLabel(a.field))}</b> from ${esc(actVal(a.field, a.old_value))} to <b>${esc(actVal(a.field, a.new_value))}</b>`;
       return `<div class="hist-row"><time>${esc(when)}</time><div><b>${esc(a.actor)}</b> ${what}</div></div>`;
-    }).join('') : '<div class="hist-row"><div style="color:var(--slate-mid)">No changes recorded yet.</div></div>';
+    }).join('') : '<div class="hist-row"><div style="color:var(--muted)">No changes recorded yet.</div></div>';
   } catch (e){
-    $('#dHistory').innerHTML = `<div class="hist-row"><div style="color:var(--amber)">Could not load activity.</div></div>`;
+    $('#dHistory').innerHTML = `<div class="hist-row"><div style="color:var(--danger)">Could not load activity.</div></div>`;
   }
 }
 function closeDrawer(){
@@ -673,7 +778,7 @@ async function saveDrawer(){
     title: $('#dTitle').value.trim() || t.title,
     stream: $('#dStream').value, pri: $('#dPri').value,
     owner: $('#dOwner').value, reviewer: $('#dReviewer').value,
-    status: $('#dStatus').value,
+    status: $('#dStatus').value, effort: Number($('#dEffort').value || 0),
     start_date: $('#dStart').value, eta: $('#dEta').value,
     prog: Number($('#dProg').value), notes: $('#dNotes').value,
   };
@@ -681,16 +786,310 @@ async function saveDrawer(){
   await patchRow('task', id, patch);
 }
 
+/* -- Create meeting / milestone (shared by the topbar and the timeline) --- */
+async function createMeeting(){
+  try {
+    const row = await req('POST','/api/meetings', {
+      title:'New meeting', meeting_date:TODAY, start_time:'09:00', end_time:'10:00',
+      kind:'Internal', attendees:[state.actor], agenda:'',
+    });
+    replaceRow('meetings', row); renderCurrent(); toast('Meeting added');
+  } catch (err){ toast(`Create failed: ${esc(err.message)}`, true); }
+}
+async function createMilestone(){
+  try {
+    const row = await req('POST','/api/milestones', {
+      title:'New milestone', due_date:TODAY, status:'On Track', owner:state.actor, notes:'',
+    });
+    replaceRow('milestones', row); renderCurrent(); toast('Milestone added');
+  } catch (err){ toast(`Create failed: ${esc(err.message)}`, true); }
+}
+
+/* -- Meeting / milestone modal (create + edit) --------------------------
+   One modal serves both entities. Type maps to a table; the generic Title /
+   Date / Time / Notes fields map to that table's columns. Editing reuses
+   patchRow (optimistic locking); creating POSTs; both land on the timeline. */
+const addHour = t => {
+  const [h,m] = String(t || '09:00').split(':').map(Number);
+  return String(((h||0)+1) % 24).padStart(2,'0') + ':' + String(m||0).padStart(2,'0');
+};
+function evTimeVisibility(){ $('#evTimeField').style.display = $('#evType').value === 'meeting' ? '' : 'none'; }
+
+function openEventModal(type, edit){
+  state.evEdit = edit || null;
+  const kind = edit ? edit.kind : (type === 'meeting' ? 'meet' : 'ms');
+  let row = null;
+  if (edit){
+    row = (kind === 'ms' ? state.milestones : state.meetings).find(r => r.id === edit.id);
+    if (!row) return;
+  }
+  $('#evType').value = kind === 'meet' ? 'meeting' : 'milestone';
+  $('#evType').disabled = !!edit;                       // no cross-type conversion on edit
+  $('#evTitleInput').value = row ? (row.title || '') : '';
+  if (kind === 'ms'){
+    $('#evDate').value  = row ? (row.due_date || '') : TODAY;
+    $('#evTime').value  = '';
+    $('#evNotes').value = row ? (row.notes || '') : '';
+  } else {
+    $('#evDate').value  = row ? (row.meeting_date || '') : TODAY;
+    $('#evTime').value  = row ? (row.start_time || '').slice(0,5) : '';
+    $('#evNotes').value = row ? (row.agenda || '') : '';
+  }
+  evTimeVisibility();
+  $('#evTitle').textContent = (edit ? 'Edit ' : 'Add ') + (kind === 'meet' ? 'meeting' : 'milestone');
+  $('#evDelete').hidden = !edit;
+  $('#evModal').classList.add('open');
+  $('#evScrim').classList.add('open');
+  setTimeout(() => $('#evTitleInput').focus(), 40);
+}
+function closeEventModal(){
+  state.evEdit = null;
+  $('#evModal').classList.remove('open');
+  $('#evScrim').classList.remove('open');
+}
+async function saveEventModal(){
+  const typeVal = $('#evType').value;
+  const title = $('#evTitleInput').value.trim();
+  const date  = $('#evDate').value;
+  const time  = $('#evTime').value;
+  const notes = $('#evNotes').value;
+  if (!title || !date){ toast('Please enter a title and date', true); return; }
+
+  const edit = state.evEdit;
+  if (edit){
+    if (edit.kind === 'ms') await patchRow('milestone', edit.id, { title, due_date: date, notes });
+    else                    await patchRow('meeting',   edit.id, { title, meeting_date: date, start_time: time || '09:00', agenda: notes });
+    closeEventModal();
+    return;
+  }
+  try {
+    if (typeVal === 'milestone'){
+      const row = await req('POST','/api/milestones', { title, due_date: date, status:'On Track', owner:state.actor, notes });
+      replaceRow('milestones', row);
+    } else {
+      const st = time || '09:00';
+      const row = await req('POST','/api/meetings', { title, meeting_date: date, start_time: st, end_time: addHour(st), kind:'Internal', attendees:[state.actor], agenda: notes });
+      replaceRow('meetings', row);
+    }
+    renderCurrent();
+    toast(typeVal === 'milestone' ? 'Milestone added' : 'Meeting added');
+    closeEventModal();
+  } catch (err){ toast(`Save failed: ${esc(err.message)}`, true); }
+}
+function deleteEventModal(){
+  const edit = state.evEdit;
+  if (!edit) return;
+  if (!confirm('Delete this ' + (edit.kind === 'ms' ? 'milestone' : 'meeting') + '?')) return;
+  const coll = edit.kind === 'ms' ? 'milestones' : 'meetings';
+  req('DELETE', `/api/${coll}/${edit.id}`).catch(err => toast(esc(err.message), true));
+  closeEventModal();
+}
+
+/* -- CSV export (shared by board and reports) ---------------------------- */
+function taskCsv(rows){
+  const cols = ['sim','title','stream','owner','reviewer','status','pri','effort','start_date','eta','prog','notes'];
+  const qv = v => `"${String(v ?? '').replace(/"/g,'""')}"`;
+  return [cols.join(',')].concat(rows.map(t => cols.map(c => qv(t[c])).join(','))).join('\n');
+}
+function downloadCsv(csv, filename){
+  const url = URL.createObjectURL(new Blob([csv], { type:'text/csv;charset=utf-8' }));
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* -- Workstreams (cards) ------------------------------------------------- */
+function streamStats(ws){
+  const rows = state.tasks.filter(t => t.stream === ws);
+  const prog = rows.length ? Math.round(rows.reduce((a,b) => a + Number(b.prog || 0), 0) / rows.length) : 0;
+  const counts = {};                                   // most frequent owner in the stream
+  rows.forEach(t => { if (t.owner) counts[t.owner] = (counts[t.owner] || 0) + 1; });
+  let owner = '--', best = 0;
+  Object.entries(counts).forEach(([o,c]) => { if (c > best){ best = c; owner = o; } });
+  return { count: rows.length, prog, owner };
+}
+function renderWorkstreams(){
+  const streams = (state.meta.streams || []).filter(ws => state.tasks.some(t => t.stream === ws));
+  $('#wsCards').innerHTML = streams.length ? streams.map(ws => {
+    const s = streamStats(ws);
+    return `<button class="ws-card" data-stream="${esc(ws)}">
+      <div class="ws-name">${esc(ws)}</div>
+      <div class="ws-row"><span>Progress</span><b>${s.prog}%</b></div>
+      <div class="ws-row"><span>Owner</span><b>${esc(s.owner)}</b></div>
+      <div class="ws-row"><span>Tasks</span><b>${s.count}</b></div>
+      <div class="ws-bar"><span style="width:${s.prog}%"></span></div>
+    </button>`;
+  }).join('') : `<div class="empty-state"><span class="eyebrow">No workstreams</span>No tasks yet.</div>`;
+}
+
+/* -- Team workload ------------------------------------------------------- */
+function personCapacity(name){
+  const p = (state.meta.people || []).find(x => (x.name || x) === name);
+  const cap = (p && typeof p === 'object') ? Number(p.capacity) : NaN;   // meta capacity is already effective
+  return Number.isFinite(cap) ? cap : Number((state.meta.settings && state.meta.settings.default_capacity) || 0);
+}
+function personWorkload(name){
+  const cap = personCapacity(name);
+  let assigned = 0, completed = 0;
+  state.tasks.forEach(t => {
+    if (t.owner !== name) return;
+    const e = Number(t.effort || 0);
+    if (t.status === 'Done') completed += e; else assigned += e;
+  });
+  const remaining = Math.max(0, assigned - completed);
+  let status = 'Available';
+  if (cap > 0 && assigned > cap) status = 'Overloaded';
+  else if (cap > 0 && assigned >= 0.9 * cap) status = 'At capacity';
+  return { cap, assigned, completed, remaining, status };
+}
+function renderWorkload(){
+  const names = peopleNames();
+  if (!names.length){ $('#wlPeople').innerHTML = ''; $('#wlDetail').innerHTML = `<div class="empty-state">No people yet.</div>`; return; }
+  if (!state.wlPerson || !names.includes(state.wlPerson)) state.wlPerson = names.includes(state.actor) ? state.actor : names[0];
+  const sel = state.wlPerson;
+  $('#wlPeople').innerHTML = names.map(n =>
+    `<button class="wl-person${n === sel ? ' active' : ''}" data-person="${esc(n)}"><span class="avatar">${esc(initials(n))}</span><span class="nm">${esc(n)}</span></button>`).join('');
+  const w = personWorkload(sel);
+  const badge = w.status === 'Overloaded' ? 'over' : w.status === 'At capacity' ? 'at' : 'ok';
+  const tasks = state.tasks.filter(t => t.owner === sel && t.status !== 'Done')
+    .sort((a,b) => String(a.eta).localeCompare(String(b.eta)));
+  $('#wlDetail').innerHTML = `
+    <div class="wl-head"><span class="avatar lg">${esc(initials(sel))}</span><h3>${esc(sel)}</h3><span class="wl-badge ${badge}">${esc(w.status)}</span></div>
+    <div class="wl-stats">
+      <div><span>Capacity</span><b class="wl-cap" data-person="${esc(sel)}" data-cap="${w.cap}" tabindex="0" role="button" title="Click to edit capacity">${esc(fmtEffort(w.cap))}</b></div>
+      <div><span>Assigned</span><b>${esc(fmtEffort(w.assigned))}</b></div>
+      <div><span>Completed</span><b>${esc(fmtEffort(w.completed))}</b></div>
+      <div><span>Remaining</span><b>${esc(fmtEffort(w.remaining))}</b></div>
+    </div>
+    <div class="wl-tasks"><span class="eyebrow">Assigned tasks</span>
+      ${tasks.length ? tasks.map(t => `<div class="wl-task" data-open="${t.id}">
+        <span class="chip ${STATUS_CLASS[t.status] || 's-not'}">${esc(t.status)}</span>
+        <span class="wl-task-title">${esc(t.title)}</span>
+        <span class="wl-task-eff">${esc(fmtEffort(t.effort))}</span>
+      </div>`).join('') : `<div class="wl-empty">No open tasks.</div>`}
+    </div>`;
+}
+
+/* Merge a people-table row into meta.people as an effective-capacity entry. */
+function upsertMetaPerson(row){
+  const arr = state.meta.people || (state.meta.people = []);
+  const def = state.meta.settings ? Number(state.meta.settings.default_capacity) : null;
+  const entry = { name: row.name, capacity: row.capacity == null ? def : Number(row.capacity) };
+  const i = arr.findIndex(p => (p.name || p) === row.name);
+  if (i >= 0) arr[i] = entry; else arr.push(entry);
+  arr.sort((a,b) => String(a.name).localeCompare(String(b.name)));
+}
+async function savePersonCapacity(name, val){
+  const capacity = val === '' ? null : Math.max(0, Number(val) || 0);   // blank -> fall back to default
+  try {
+    const row = await req('PATCH', `/api/people/${encodeURIComponent(name)}`, { patch: { capacity } });
+    upsertMetaPerson(row);
+    renderWorkload();
+    toast('Capacity updated');
+  } catch (e){
+    renderWorkload();
+    toast(`Save failed: ${esc(e.message)}`, true);
+  }
+}
+/* Click-to-edit the Capacity figure; writes via PATCH /api/people/:name. */
+function editCapacity(el){
+  const name = el.dataset.person;
+  const input = document.createElement('input');
+  input.type = 'number'; input.min = '0'; input.step = '0.5';
+  input.className = 'wl-cap-input';
+  input.value = Number(el.dataset.cap) || 0;
+  el.replaceWith(input);
+  input.focus(); try { input.select(); } catch(e){}
+  let done = false;
+  const commit = () => { if (done) return; done = true; savePersonCapacity(name, input.value); };
+  input.addEventListener('blur', commit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter'){ e.preventDefault(); input.blur(); }
+    else if (e.key === 'Escape'){ done = true; renderWorkload(); }
+  });
+}
+
+/* -- Reports (executive) ------------------------------------------------- */
+function renderReports(){
+  const n = s => state.tasks.filter(t => t.status === s).length;
+  const pct = sprintPct();
+  const statusRows = [['Completed', n('Done')], ['In Progress', n('In Progress')], ['Blocked', n('Blocked')], ['Not Started', n('Not Started')]];
+  const rows = peopleNames().map(nm => ({ nm, ...personWorkload(nm) }));
+  $('#reportBody').innerHTML = `
+    <section class="rpt-section"><span class="eyebrow">Sprint progress</span><div class="rpt-big">${pct}%</div></section>
+    <section class="rpt-section"><span class="eyebrow">Status</span>
+      <div class="rpt-status">${statusRows.map(([l,v]) => `<div class="rpt-stat"><div class="rpt-stat-v">${v}</div><div class="rpt-stat-l">${esc(l)}</div></div>`).join('')}</div>
+    </section>
+    <section class="rpt-section"><span class="eyebrow">Workload</span>
+      <div class="rpt-workload">${rows.map(w => {
+        const pctCap = w.cap ? Math.min(100, Math.round(w.assigned / w.cap * 100)) : 0;
+        return `<div class="rpt-wl-row">
+          <span class="rpt-wl-name">${esc(w.nm)}</span>
+          <span class="rpt-wl-bar${w.status === 'Overloaded' ? ' over' : ''}"><span style="width:${pctCap}%"></span></span>
+          <span class="rpt-wl-num">${esc(fmtEffort(w.assigned))} / ${esc(fmtEffort(w.cap))}</span>
+          ${w.status === 'Overloaded' ? '<span class="rpt-over">Over</span>' : ''}
+        </div>`;
+      }).join('')}</div>
+    </section>
+    <section class="rpt-section"><span class="eyebrow">AI summary</span>
+      <div class="rpt-ai">
+        <div class="rpt-ai-label">Sample text — illustrative only, not generated</div>
+        <p>This is placeholder narrative showing where an at-a-glance summary would sit. It is not produced from the data on this page and no model was called. A future iteration could summarise progress, call out blockers, and flag schedule risks here.</p>
+      </div>
+    </section>`;
+}
+
+/* -- Settings drawer ----------------------------------------------------- */
+function openSettings(){
+  const s = state.meta.settings || {};
+  $('#setProject').value = s.project_name || '';
+  const presets = ['Hours','Days','Story Points'];
+  if (presets.includes(s.capacity_unit)){ $('#setUnit').value = s.capacity_unit; $('#setCustomField').hidden = true; $('#setUnitCustom').value = ''; }
+  else { $('#setUnit').value = '__custom'; $('#setCustomField').hidden = false; $('#setUnitCustom').value = s.capacity_unit || ''; }
+  $('#setAbbrev').value = s.unit_abbrev || '';
+  $('#setCapacity').value = Number(s.default_capacity || 0);
+  $('#setSprint').value = s.sprint_length_days || 14;
+  $('#setTz').value = s.timezone || '';
+  $('#setDrawer').classList.add('open'); $('#setScrim').classList.add('open');
+  setTimeout(() => $('#setProject').focus(), 40);
+}
+function closeSettings(){ $('#setDrawer').classList.remove('open'); $('#setScrim').classList.remove('open'); }
+async function saveSettings(){
+  const unitSel = $('#setUnit').value;
+  const patch = {
+    project_name: $('#setProject').value.trim() || 'Sprint Board',
+    capacity_unit: unitSel === '__custom' ? ($('#setUnitCustom').value.trim() || 'Custom') : unitSel,
+    unit_abbrev: $('#setAbbrev').value.trim() || 'h',
+    default_capacity: Number($('#setCapacity').value || 0),
+    sprint_length_days: parseInt($('#setSprint').value, 10) || 14,
+    timezone: $('#setTz').value.trim() || 'UTC',
+  };
+  const version = state.meta.settings ? state.meta.settings.version : undefined;
+  try {
+    const row = await req('PATCH','/api/settings', { patch, version });
+    state.meta.settings = row; applySettings(); renderCurrent();
+    closeSettings(); toast('Settings saved');
+  } catch (e){
+    if (e.status === 409 && e.current){ state.meta.settings = e.current; applySettings(); renderCurrent(); toast('Settings were changed elsewhere — reloaded.', true); }
+    else toast(`Save failed: ${esc(e.message)}`, true);
+  }
+}
+
 /* -- Event wiring -------------------------------------------------------- */
-$$('.nav-item').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
-['#q','#fOwner','#fStatus','#fStream'].forEach(s => {
-  $(s).addEventListener('input', () => { renderBoard(); renderRibbon(); });
-  $(s).addEventListener('change', () => { renderBoard(); renderRibbon(); });
+$$('.nav-item').forEach(b => b.addEventListener('click', () => {
+  setActiveNav(b);
+  state.scope = b.dataset.scope || 'all';         // Views/Planning reset to the full board
+  setView(b.dataset.view);
+}));
+
+['#q','#fOwner','#fReviewer','#fStatus','#fStream'].forEach(s => {
+  $(s).addEventListener('input', () => { renderBoard(); renderSummary(); });
+  $(s).addEventListener('change', () => { renderBoard(); renderSummary(); });
 });
 $('#clearF').addEventListener('click', () => {
-  $('#q').value=''; $('#fOwner').value=''; $('#fStatus').value=''; $('#fStream').value='';
-  renderBoard(); renderRibbon();
+  $('#q').value=''; $('#fOwner').value=''; $('#fReviewer').value=''; $('#fStatus').value=''; $('#fStream').value='';
+  renderBoard(); renderSummary();
 });
+$('#exportBtn').addEventListener('click', () => downloadCsv(taskCsv(visibleTasks()), 'sprint-24-board.csv'));
 
 /* Board: one delegated listener handles open / edit / slider */
 $('#board').addEventListener('click', e => {
@@ -732,58 +1131,50 @@ $('#msTable').addEventListener('click', e => {
 });
 $('#cal').addEventListener('click', e => {
   const op = e.target.closest('[data-open]');
-  if (op){ setView('board'); openDrawer(+op.dataset.open); }
+  if (op){ openDrawer(+op.dataset.open); }
 });
 $('#ganttGrid').addEventListener('click', e => {
+  const sec = e.target.closest('.g-stream');
+  if (sec){ toggleSection(sec.dataset.stream); return; }
+  const ev = e.target.closest('[data-ev-id]');
+  if (ev){ openEventModal(null, { kind: ev.dataset.evKind, id: +ev.dataset.evId }); return; }
   const op = e.target.closest('[data-open]');
   if (op) openDrawer(+op.dataset.open);
 });
+$('#ganttGrid').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const sec = e.target.closest('.g-stream');
+  if (sec){ e.preventDefault(); toggleSection(sec.dataset.stream); }
+});
 
-/* Top-bar buttons are rendered dynamically, so delegate */
+/* Top-bar create buttons are rendered per view, so delegate */
 $('#viewActions').addEventListener('click', async e => {
   const id = e.target.id;
   if (id === 'addTask'){
-    const seq = state.tasks.length + 1;
     try {
       const row = await req('POST','/api/tasks', {
         sim:`SIM-${Date.now().toString().slice(-5)}`, title:'New task', stream:'PMO',
         owner:state.actor, reviewer:'', status:'Not Started', pri:'P2',
-        start_date:TODAY, eta:iso(addDays(new Date(TODAY+'T00:00:00'),5)), prog:0, notes:'',
+        start_date:TODAY, eta:iso(addDays(new Date(TODAY+'T00:00:00'),5)), prog:0, notes:'', effort:0,
       });
       replaceRow('tasks', row); renderCurrent(); openDrawer(row.id);
     } catch (err){ toast(`Create failed: ${esc(err.message)}`, true); }
   }
-  if (id === 'addMeet'){
-    try {
-      const row = await req('POST','/api/meetings', {
-        title:'New meeting', meeting_date:TODAY, start_time:'09:00', end_time:'10:00',
-        kind:'Internal', attendees:[state.actor], agenda:'',
-      });
-      replaceRow('meetings', row); renderCurrent();
-    } catch (err){ toast(`Create failed: ${esc(err.message)}`, true); }
-  }
-  if (id === 'addMs'){
-    try {
-      const row = await req('POST','/api/milestones', {
-        title:'New milestone', due_date:TODAY, status:'On Track', owner:state.actor, notes:'',
-      });
-      replaceRow('milestones', row); renderCurrent();
-    } catch (err){ toast(`Create failed: ${esc(err.message)}`, true); }
-  }
-  if (id === 'exportBtn'){
-    const cols = ['sim','title','stream','owner','reviewer','status','pri','start_date','eta','prog','notes'];
-    const qv = v => `"${String(v ?? '').replace(/"/g,'""')}"`;
-    const csv = [cols.join(',')].concat(visibleTasks().map(t => cols.map(c=>qv(t[c])).join(','))).join('\n');
-    const url = URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
-    const a = document.createElement('a'); a.href = url; a.download = 'sprint-24-board.csv'; a.click();
-    URL.revokeObjectURL(url);
-  }
+  if (id === 'addMeet') createMeeting();
+  if (id === 'addMs')   createMilestone();
 });
+
+$('#gearBtn').addEventListener('click', openSettings);
 
 $('#dSave').addEventListener('click', saveDrawer);
 $('#dClose').addEventListener('click', closeDrawer);
 $('#scrim').addEventListener('click', closeDrawer);
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && state.openId !== null) closeDrawer(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if ($('#evModal').classList.contains('open')) closeEventModal();
+  else if ($('#setDrawer').classList.contains('open')) closeSettings();
+  else if (state.openId !== null) closeDrawer();
+});
 $('#dProg').addEventListener('input', e => {
   e.target.style.setProperty('--pct', e.target.value + '%');
   $('#dProgVal').textContent = e.target.value + '%';
@@ -796,11 +1187,52 @@ $('#cPrev').addEventListener('click',  () => { state.calMonth = new Date(state.c
 $('#cNext').addEventListener('click',  () => { state.calMonth = new Date(state.calMonth.getFullYear(), state.calMonth.getMonth()+1, 1); renderCalendar(); });
 $('#cToday').addEventListener('click', () => { const d=new Date(TODAY+'T00:00:00'); state.calMonth = new Date(d.getFullYear(), d.getMonth(), 1); renderCalendar(); });
 
-$('#expandAll').addEventListener('click', () => {
-  const w = $('#tableWrap');
-  const full = w.style.maxHeight === 'none';
-  w.style.maxHeight = full ? '' : 'none';
-  $('#expandAll').textContent = full ? 'Fit to content' : 'Collapse';
+$('#tlAddMs').addEventListener('click', () => openEventModal('milestone'));
+$('#tlAddMeet').addEventListener('click', () => openEventModal('meeting'));
+
+$('#evType').addEventListener('change', () => {
+  evTimeVisibility();
+  if (!state.evEdit) $('#evTitle').textContent = 'Add ' + ($('#evType').value === 'meeting' ? 'meeting' : 'milestone');
+});
+$('#evSave').addEventListener('click', saveEventModal);
+$('#evCancel').addEventListener('click', closeEventModal);
+$('#evDelete').addEventListener('click', deleteEventModal);
+$('#evScrim').addEventListener('click', closeEventModal);
+
+/* Phase 3: workstreams, workload, reports, settings */
+$('#wsCards').addEventListener('click', e => {
+  const c = e.target.closest('.ws-card');
+  if (!c) return;
+  $('#fStream').value = c.dataset.stream; state.scope = 'all';   // open the board filtered to this workstream
+  const nav = document.querySelector('.nav-item[data-view="board"][data-scope="all"]');
+  if (nav) setActiveNav(nav);
+  setView('board');
+});
+$('#wlPeople').addEventListener('click', e => {
+  const p = e.target.closest('[data-person]');
+  if (p){ state.wlPerson = p.dataset.person; renderWorkload(); }
+});
+$('#wlDetail').addEventListener('click', e => {
+  const cap = e.target.closest('.wl-cap');
+  if (cap){ editCapacity(cap); return; }
+  const op = e.target.closest('[data-open]');
+  if (op) openDrawer(+op.dataset.open);
+});
+$('#wlDetail').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const cap = e.target.closest('.wl-cap');
+  if (cap){ e.preventDefault(); editCapacity(cap); }
+});
+$('#rptCsv').addEventListener('click', () => downloadCsv(taskCsv(state.tasks), 'sprint-24-report.csv'));
+$('#rptPdf').addEventListener('click', () => window.print());
+$('#setSave').addEventListener('click', saveSettings);
+$('#setCancel').addEventListener('click', closeSettings);
+$('#setScrim').addEventListener('click', closeSettings);
+$('#setUnit').addEventListener('change', () => {
+  const v = $('#setUnit').value;
+  $('#setCustomField').hidden = v !== '__custom';
+  const ab = { 'Hours':'h', 'Days':'d', 'Story Points':'pts' }[v];
+  if (ab) $('#setAbbrev').value = ab;
 });
 
 initGate();

@@ -21,11 +21,63 @@ const q = (sql, params) => pool.query(sql, params);
    client needed, no shell access on the host, no manual step.
 
    Guarded two ways:
-     - only runs when the `tasks` table is absent, so it can never wipe data
+     - the full schema+seed only runs when the `tasks` table is absent, so it
+       can never wipe data
      - takes a Postgres advisory lock, so two instances starting at the same
        time cannot both run it
-   Set SEED_ON_INIT=false to create the schema without the demo rows.       */
+   Set SEED_ON_INIT=false to create the schema without the demo rows.
+
+   After that check, a short block of ADDITIVE_MIGRATIONS runs on every boot.
+   Every statement is idempotent and non-destructive, so an already-deployed
+   database is brought up to the current shape without a drop/recreate.        */
 const MIGRATION_LOCK = 727301;
+
+/* Additive, idempotent DDL. Safe to run repeatedly and never destroys data.
+   Mirrors the canonical definitions in db/schema.sql; this is the path that
+   upgrades a database that already holds rows. */
+const ADDITIVE_MIGRATIONS = `
+  ALTER TABLE tasks ADD COLUMN IF NOT EXISTS effort NUMERIC(6,1) NOT NULL DEFAULT 0;
+
+  CREATE TABLE IF NOT EXISTS settings (
+    id                 INTEGER PRIMARY KEY DEFAULT 1,
+    project_name       TEXT NOT NULL DEFAULT 'Sprint Board',
+    capacity_unit      TEXT NOT NULL DEFAULT 'Hours',
+    unit_abbrev        TEXT NOT NULL DEFAULT 'h',
+    default_capacity   NUMERIC(6,1) NOT NULL DEFAULT 40,
+    sprint_length_days INTEGER NOT NULL DEFAULT 14,
+    timezone           TEXT NOT NULL DEFAULT 'America/Chicago',
+    version            INTEGER NOT NULL DEFAULT 1,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by         TEXT,
+    CONSTRAINT settings_single_row CHECK (id = 1)
+  );
+
+  CREATE TABLE IF NOT EXISTS people (
+    name       TEXT PRIMARY KEY,
+    capacity   NUMERIC(6,1),
+    active     BOOLEAN NOT NULL DEFAULT true,
+    version    INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+
+  -- Guarantee the single settings row exists even on a database that predates
+  -- the table (a fresh seed inserts its own row first, so this no-ops there).
+  INSERT INTO settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+  -- Backfill people from names already present in the data, so an upgraded
+  -- database has populated owner/reviewer dropdowns without needing a reseed.
+  -- (On a fresh seed the seven people already exist, so every row no-ops.)
+  INSERT INTO people (name)
+  SELECT name FROM (
+    SELECT owner            AS name FROM tasks
+    UNION SELECT reviewer          FROM tasks
+    UNION SELECT owner             FROM milestones
+    UNION SELECT unnest(attendees) FROM meetings
+  ) src
+  WHERE name IS NOT NULL AND btrim(name) <> ''
+  ON CONFLICT (name) DO NOTHING;
+`;
 
 async function migrate(){
   const client = await pool.connect();
@@ -33,22 +85,27 @@ async function migrate(){
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK]);
 
     const found = await client.query("SELECT to_regclass('public.tasks') AS t");
+    let migrated = false;
     if (found.rows[0].t){
-      console.log('[db] schema already present, skipping migration');
-      return { migrated: false };
-    }
-
-    console.log('[db] empty database detected - creating schema');
-    const dir = path.join(__dirname, '..', 'db');
-    await client.query(fs.readFileSync(path.join(dir, 'schema.sql'), 'utf8'));
-
-    if (process.env.SEED_ON_INIT === 'false'){
-      console.log('[db] SEED_ON_INIT=false, skipping seed data');
+      console.log('[db] schema already present, skipping full migration');
     } else {
-      await client.query(fs.readFileSync(path.join(dir, 'seed.sql'), 'utf8'));
-      console.log('[db] seed data loaded (mock data only)');
+      console.log('[db] empty database detected - creating schema');
+      const dir = path.join(__dirname, '..', 'db');
+      await client.query(fs.readFileSync(path.join(dir, 'schema.sql'), 'utf8'));
+
+      if (process.env.SEED_ON_INIT === 'false'){
+        console.log('[db] SEED_ON_INIT=false, skipping seed data');
+      } else {
+        await client.query(fs.readFileSync(path.join(dir, 'seed.sql'), 'utf8'));
+        console.log('[db] seed data loaded (mock data only)');
+      }
+      migrated = true;
     }
-    return { migrated: true };
+
+    // Always applied, whether the schema was just created or already existed.
+    await client.query(ADDITIVE_MIGRATIONS);
+
+    return { migrated };
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK]).catch(() => {});
     client.release();
@@ -60,7 +117,7 @@ async function migrate(){
    in the request that is not on this list is rejected outright.
    Never interpolate keys from req.body straight into SQL.                  */
 const EDITABLE = {
-  tasks:      ['sim','title','stream','owner','reviewer','status','pri','start_date','eta','prog','notes'],
+  tasks:      ['sim','title','stream','owner','reviewer','status','pri','start_date','eta','prog','notes','effort'],
   meetings:   ['title','meeting_date','start_time','end_time','kind','attendees','agenda'],
   milestones: ['title','due_date','status','owner','notes'],
 };
@@ -74,6 +131,12 @@ function coerce(table, field, raw){
     const n = Number(raw);
     if (Number.isNaN(n)) throw new HttpError(400, 'prog must be a number');
     return Math.max(0, Math.min(100, Math.round(n)));
+  }
+  if (table === 'tasks' && field === 'effort'){
+    if (raw === '' || raw === null || raw === undefined) return 0;   // cleared field -> 0
+    const n = Number(raw);
+    if (Number.isNaN(n)) throw new HttpError(400, 'effort must be a number');
+    return Math.max(0, n);                                           // NUMERIC(6,1): Postgres rounds to 1 decimal
   }
   if (field === 'attendees'){
     if (!Array.isArray(raw)) throw new HttpError(400, 'attendees must be an array');

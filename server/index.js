@@ -4,7 +4,7 @@ const path = require('path');
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
-const { q, migrate, HttpError } = require('./db');
+const { q, pool, migrate, HttpError } = require('./db');
 const crudRouter = require('./routes/crud');
 
 const app  = express();
@@ -43,22 +43,168 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-app.get('/api/meta', (req, res) => {
-  res.json({
-    actor: req.actor,
-    demo: true,
-    people:   ['Kevin','Alice','Bob','Maya','Daniel','Mike','Charlie'],
-    streams:  ['Backend','Frontend','QA','PMO'],
-    statuses: ['Not Started','In Progress','In Review','Blocked','Done'],
-    pris:     ['P0','P1','P2'],
-    msStatuses: ['On Track','At Risk','Missed','Done'],
-    kinds:    ['Stand-up','Review','Planning','Internal','Client'],
-  });
+app.get('/api/meta', async (req, res, next) => {
+  try {
+    /* people now come from the table, so a name typed at the gate reaches every
+       client's dropdowns. capacity is the effective value: a person's own
+       capacity, or settings.default_capacity when they have not set one. */
+    const [peopleR, settingsR] = await Promise.all([
+      q(`SELECT name,
+                COALESCE(capacity, (SELECT default_capacity FROM settings WHERE id = 1))::float8 AS capacity
+           FROM people WHERE active = true ORDER BY name`),
+      q('SELECT * FROM settings WHERE id = 1'),
+    ]);
+    res.json({
+      actor: req.actor,
+      demo: true,
+      people:   peopleR.rows,                 // [{ name, capacity }]
+      settings: settingsR.rows[0] || null,
+      streams:  ['Backend','Frontend','QA','PMO'],
+      statuses: ['Not Started','In Progress','In Review','Blocked','Done'],
+      pris:     ['P0','P1','P2'],
+      msStatuses: ['On Track','At Risk','Missed','Done'],
+      kinds:    ['Stand-up','Review','Planning','Internal','Client'],
+    });
+  } catch (e){ next(e); }
 });
 
 app.use('/api/tasks',      crudRouter('tasks',      'eta NULLS LAST, id',        getIO));
 app.use('/api/meetings',   crudRouter('meetings',   'meeting_date, start_time',  getIO));
 app.use('/api/milestones', crudRouter('milestones', 'due_date, id',              getIO));
+
+/* -- Settings: one row, project-wide configuration ----------------------
+   Same optimistic-locking contract as the CRUD resources (PATCH with
+   { patch, version }; a stale version returns 409). The settings:updated
+   broadcast lets open clients pick up a unit change without reloading. */
+const SETTINGS_FIELDS = ['project_name','capacity_unit','unit_abbrev','default_capacity','sprint_length_days','timezone'];
+
+function coerceSetting(field, raw){
+  if (field === 'default_capacity'){
+    const n = Number(raw);
+    if (Number.isNaN(n)) throw new HttpError(400, 'default_capacity must be a number');
+    return Math.max(0, n);
+  }
+  if (field === 'sprint_length_days'){
+    const n = parseInt(raw, 10);
+    if (Number.isNaN(n)) throw new HttpError(400, 'sprint_length_days must be a number');
+    return Math.max(1, n);
+  }
+  return raw === undefined || raw === null ? '' : String(raw);
+}
+
+app.get('/api/settings', async (req, res, next) => {
+  try {
+    const r = await q('SELECT * FROM settings WHERE id = 1');
+    res.json(r.rows[0] || null);
+  } catch (e){ next(e); }
+});
+
+app.patch('/api/settings', async (req, res, next) => {
+  try {
+    const patch   = req.body && req.body.patch ? req.body.patch : req.body;
+    const version = req.body ? req.body.version : undefined;
+    const fields  = Object.keys(patch || {}).filter(f => SETTINGS_FIELDS.includes(f));
+    if (!fields.length) throw new HttpError(400, 'no updatable fields supplied');
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const before = await client.query('SELECT * FROM settings WHERE id = 1 FOR UPDATE');
+      if (!before.rows.length) throw new HttpError(404, 'settings not found');
+      const row = before.rows[0];
+
+      if (version !== undefined && version !== null && Number(version) !== row.version){
+        throw new HttpError(409, 'This record was modified by someone else', {
+          conflict: true, current: row, lastEditor: row.updated_by,
+        });
+      }
+
+      const sets = fields.map((f,i) => `${f} = $${i + 1}`);
+      const vals = fields.map(f => coerceSetting(f, patch[f]));
+      const upd = await client.query(
+        `UPDATE settings SET ${sets.join(', ')},
+                             version = version + 1,
+                             updated_at = now(),
+                             updated_by = $${vals.length + 1}
+          WHERE id = 1 AND version = $${vals.length + 2}
+      RETURNING *`,
+        [...vals, req.actor, row.version]
+      );
+      await client.query('COMMIT');
+      const saved = upd.rows[0];
+      io.emit('settings:updated', { row: saved, _actor: req.actor });
+      res.json(saved);
+    } catch (e){
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e){ next(e); }
+});
+
+/* -- People: the roster behind the owner/reviewer dropdowns --------------
+   POST upserts a name (called when someone enters it at the gate); PATCH sets
+   a person's capacity. Both broadcast people:updated so other clients refresh
+   their dropdowns and workload figures. */
+app.post('/api/people', async (req, res, next) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 40);
+    if (!name) throw new HttpError(400, 'name is required');
+    const r = await q(
+      `INSERT INTO people (name) VALUES ($1)
+       ON CONFLICT (name) DO UPDATE SET active = true, updated_at = now()
+       RETURNING *`, [name]);
+    const row = r.rows[0];
+    io.emit('people:updated', { row, _actor: req.actor });
+    res.status(201).json(row);
+  } catch (e){ next(e); }
+});
+
+app.patch('/api/people/:name', async (req, res, next) => {
+  try {
+    const name    = String(req.params.name || '').trim();
+    const patch   = req.body && req.body.patch ? req.body.patch : req.body;
+    const version = req.body ? req.body.version : undefined;
+    if (!patch || patch.capacity === undefined) throw new HttpError(400, 'capacity is required');
+
+    let capacity;
+    if (patch.capacity === '' || patch.capacity === null){
+      capacity = null;                                  // null -> fall back to settings.default_capacity
+    } else {
+      const n = Number(patch.capacity);
+      if (Number.isNaN(n)) throw new HttpError(400, 'capacity must be a number');
+      capacity = Math.max(0, n);
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const before = await client.query('SELECT * FROM people WHERE name = $1 FOR UPDATE', [name]);
+      if (!before.rows.length) throw new HttpError(404, 'person not found');
+      const row = before.rows[0];
+
+      if (version !== undefined && version !== null && Number(version) !== row.version){
+        throw new HttpError(409, 'This record was modified by someone else', { conflict: true, current: row });
+      }
+
+      const upd = await client.query(
+        `UPDATE people SET capacity = $1, version = version + 1, updated_at = now()
+          WHERE name = $2 AND version = $3 RETURNING *`,
+        [capacity, name, row.version]
+      );
+      await client.query('COMMIT');
+      const saved = upd.rows[0];
+      io.emit('people:updated', { row: saved, _actor: req.actor });
+      res.json(saved);
+    } catch (e){
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e){ next(e); }
+});
 
 /* Activity feed - backs the Activity section in the task drawer */
 app.get('/api/activity', async (req, res, next) => {
