@@ -929,11 +929,16 @@ function personCapacity(name){
 }
 function personWorkload(name){
   const cap = personCapacity(name);
+  // Workload definitions (keep identical here and in Reports so the pages never disagree):
+  //   Assigned  = total effort of every task owned by the person, INCLUDING Done
+  //   Completed = total effort of their Done tasks
+  //   Remaining = Assigned - Completed, floored at 0
   let assigned = 0, completed = 0;
   state.tasks.forEach(t => {
     if (t.owner !== name) return;
     const e = Number(t.effort || 0);
-    if (t.status === 'Done') completed += e; else assigned += e;
+    assigned += e;
+    if (t.status === 'Done') completed += e;
   });
   const remaining = Math.max(0, assigned - completed);
   let status = 'Available';
@@ -950,7 +955,8 @@ function renderWorkload(){
     `<button class="wl-person${n === sel ? ' active' : ''}" data-person="${esc(n)}"><span class="avatar">${esc(initials(n))}</span><span class="nm">${esc(n)}</span></button>`).join('');
   const w = personWorkload(sel);
   const badge = w.status === 'Overloaded' ? 'over' : w.status === 'At capacity' ? 'at' : 'ok';
-  const tasks = state.tasks.filter(t => t.owner === sel && t.status !== 'Done')
+  // Include Done tasks so the list's efforts visibly sum to the Assigned figure (see personWorkload).
+  const tasks = state.tasks.filter(t => t.owner === sel)
     .sort((a,b) => String(a.eta).localeCompare(String(b.eta)));
   $('#wlDetail').innerHTML = `
     <div class="wl-head"><span class="avatar lg">${esc(initials(sel))}</span><h3>${esc(sel)}</h3><span class="wl-badge ${badge}">${esc(w.status)}</span></div>
@@ -965,7 +971,7 @@ function renderWorkload(){
         <span class="chip ${STATUS_CLASS[t.status] || 's-not'}">${esc(t.status)}</span>
         <span class="wl-task-title">${esc(t.title)}</span>
         <span class="wl-task-eff">${esc(fmtEffort(t.effort))}</span>
-      </div>`).join('') : `<div class="wl-empty">No open tasks.</div>`}
+      </div>`).join('') : `<div class="wl-empty">No tasks.</div>`}
     </div>`;
 }
 
@@ -1013,6 +1019,10 @@ function renderReports(){
   const n = s => state.tasks.filter(t => t.status === s).length;
   const pct = sprintPct();
   const statusRows = [['Completed', n('Done')], ['In Progress', n('In Progress')], ['Blocked', n('Blocked')], ['Not Started', n('Not Started')]];
+  // Workload uses the same definitions as the Team Workload page (via personWorkload) so the two pages never disagree:
+  //   Assigned  = total effort of every task owned by the person, INCLUDING Done
+  //   Completed = total effort of their Done tasks
+  //   Remaining = Assigned - Completed, floored at 0
   const rows = peopleNames().map(nm => ({ nm, ...personWorkload(nm) }));
   $('#reportBody').innerHTML = `
     <section class="rpt-section"><span class="eyebrow">Sprint progress</span><div class="rpt-big">${pct}%</div></section>
